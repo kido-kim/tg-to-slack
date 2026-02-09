@@ -8,13 +8,15 @@ and posts to Slack daily at 9 AM KST.
 import os
 import sys
 import base64
+import re
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Optional
 import pytz
 from telethon import TelegramClient
 from telethon.tl.types import Message
 import google.generativeai as genai
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -87,20 +89,21 @@ async def fetch_yesterday_messages(client: TelegramClient, channel: str) -> List
         # Get the channel entity
         entity = await client.get_entity(channel)
         
-        # Fetch messages from yesterday
+        # Fetch messages from yesterday (get last 100 messages and filter)
         async for message in client.iter_messages(
             entity,
-            offset_date=yesterday_end,
-            reverse=True
+            limit=100
         ):
             # Convert message date to KST
             msg_date_kst = message.date.replace(tzinfo=pytz.UTC).astimezone(kst)
             
             # Check if message is from yesterday
             if msg_date_kst < yesterday_start:
-                continue
-            if msg_date_kst > yesterday_end:
+                # Older than our target date, stop searching
                 break
+            if msg_date_kst > yesterday_end:
+                # Newer than our target date, skip
+                continue
             
             # Extract text from message
             text = message.message or ""
@@ -131,20 +134,100 @@ async def fetch_yesterday_messages(client: TelegramClient, channel: str) -> List
         return []
 
 
-def summarize_with_gemini(text: str, api_key: str) -> str:
+def extract_urls(text: str) -> List[str]:
     """
-    Summarize text using Google Gemini API.
+    Extract URLs from text.
+    
+    Args:
+        text: Text containing URLs
+        
+    Returns:
+        List of URLs found in text
+    """
+    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+    urls = re.findall(url_pattern, text)
+    return urls
+
+
+def fetch_article_content(url: str) -> Optional[str]:
+    """
+    Fetch and extract main content from a URL.
+    
+    Args:
+        url: URL to fetch
+        
+    Returns:
+        Extracted text content or None if failed
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'lxml')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.decompose()
+        
+        # Try to find main content
+        content = None
+        
+        # Try common article selectors
+        article_selectors = [
+            'article',
+            '[role="article"]',
+            '.article-content',
+            '.post-content',
+            '.entry-content',
+            'main',
+        ]
+        
+        for selector in article_selectors:
+            element = soup.select_one(selector)
+            if element:
+                content = element.get_text(separator='\n', strip=True)
+                break
+        
+        # Fallback to body
+        if not content:
+            body = soup.find('body')
+            if body:
+                content = body.get_text(separator='\n', strip=True)
+        
+        if content:
+            # Clean up excessive whitespace
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
+            content = '\n'.join(lines)
+            # Limit content length
+            if len(content) > 5000:
+                content = content[:5000]
+            return content
+        
+        return None
+        
+    except Exception as e:
+        print(f"  ⚠️  Error fetching {url}: {e}")
+        return None
+
+
+def summarize_with_gemini(text: str, api_key: str, title: str = "") -> str:
+    """
+    Summarize text using Google Gemini API via REST.
     
     Args:
         text: Text to summarize
         api_key: Google Gemini API key
+        title: Optional title for context
         
     Returns:
         Korean 3-line summary
     """
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
+        # Use REST API directly for better compatibility
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={api_key}"
         
         prompt = f"""다음은 암호화폐/크립토 산업 관련 뉴스입니다. 
 이 내용을 한국어로 정확히 3줄로 요약해주세요. 
@@ -152,25 +235,36 @@ def summarize_with_gemini(text: str, api_key: str) -> str:
 번호나 불릿 포인트 없이 각 줄만 작성해주세요.
 
 뉴스 내용:
-{text}
+{text[:3000]}
 
 3줄 요약:"""
         
-        response = model.generate_content(prompt)
-        summary = response.text.strip()
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": prompt
+                }]
+            }]
+        }
+        
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        result = response.json()
+        summary = result['candidates'][0]['content']['parts'][0]['text'].strip()
         
         # Ensure we have exactly 3 lines
         lines = [line.strip() for line in summary.split('\n') if line.strip()]
         if len(lines) > 3:
             summary = '\n'.join(lines[:3])
         elif len(lines) < 3:
-            # If less than 3 lines, pad with the original text
+            # If less than 3 lines, just use what we have
             summary = '\n'.join(lines)
         
         return summary
         
     except Exception as e:
-        print(f"⚠️  Error summarizing with Gemini: {e}")
+        print(f"  ⚠️  Error summarizing with Gemini: {e}")
         # Fallback: return first 200 characters
         return text[:200] + "..." if len(text) > 200 else text
 
@@ -281,15 +375,41 @@ async def main():
             send_to_slack([], SLACK_WEBHOOK_URL, yesterday)
             return
         
-        # Summarize each message
-        print(f"🤖 Summarizing {len(messages)} messages with Google Gemini...")
+        # Summarize each message by fetching link content
+        print(f"🤖 Processing {len(messages)} messages with Google Gemini...")
         summaries = []
         for msg in messages:
-            summary_text = summarize_with_gemini(msg['text'], GEMINI_API_KEY)
+            # Extract URLs from message
+            urls = extract_urls(msg['text'])
+            
+            summary_text = None
+            article_url = None
+            
+            if urls:
+                # Try to fetch and summarize content from each URL
+                for url in urls:
+                    # Skip X.com and t.me links (require JavaScript/login)
+                    if 'x.com' in url or 't.me' in url or 'twitter.com' in url:
+                        continue
+                    
+                    print(f"  🔗 Fetching content from: {url[:60]}...")
+                    content = fetch_article_content(url)
+                    
+                    if content and len(content) > 100:
+                        # Summarize the article content
+                        summary_text = summarize_with_gemini(content, GEMINI_API_KEY)
+                        article_url = url
+                        break  # Use first successful article
+                
+            # Fallback: if no article found, use message text
+            if not summary_text:
+                summary_text = summarize_with_gemini(msg['text'], GEMINI_API_KEY)
+                article_url = urls[0] if urls else msg['link']
+            
             summaries.append({
                 'summary': summary_text,
                 'date': msg['date'],
-                'link': msg['link']
+                'link': article_url or msg['link']
             })
             print(f"  ✓ Summarized message {msg['id']}")
         
