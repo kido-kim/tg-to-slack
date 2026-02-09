@@ -1,4 +1,4 @@
-name: Daily Crypto News Summary
+name: Daily Crypto News Summary - Ahboyreads
 
 on:
   # Run daily at 9 AM KST (00:00 UTC, since KST = UTC+9)
@@ -36,7 +36,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python main.py
+          python main.py ahboyashreads
       
       - name: Upload session file (if updated)
         if: always()
