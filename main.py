@@ -205,6 +205,23 @@ def fetch_article_content(url: str) -> Optional[str]:
             # Clean up excessive whitespace
             lines = [line.strip() for line in content.split('\n') if line.strip()]
             content = '\n'.join(lines)
+            
+            # Check minimum length (500 chars)
+            if len(content) < 500:
+                return None
+            
+            # Detect paywalls and subscription prompts
+            paywall_keywords = [
+                'sign up', 'subscribe', 'subscription', 'premium',
+                '유료', '구독', 'become a member', 'join now',
+                'create account', 'log in to read', 'members only'
+            ]
+            content_lower = content.lower()
+            if any(keyword in content_lower for keyword in paywall_keywords):
+                # Check if most of the content is paywall message
+                if len(content) < 1000:  # Short content with paywall = likely blocked
+                    return None
+            
             # Limit content length
             if len(content) > 5000:
                 content = content[:5000]
@@ -443,11 +460,14 @@ async def main():
                             print(f"  🔗 Fetching content from: {url[:60]}...")
                             content = fetch_article_content(url)
                             
-                            if content and len(content) > 100:
-                                # Summarize the article content
+                            if content and len(content) >= 500:
+                                # Summarize the article content (only if sufficient content)
+                                print(f"      ✓ Fetched {len(content)} chars")
                                 summary_text = summarize_with_gemini(content, GEMINI_API_KEY)
                                 article_url = url
                                 break  # Use first successful article
+                            elif content:
+                                print(f"      ⚠️  Content too short ({len(content)} chars), skipping")
                     
                     # Skip if no article could be scraped
                     if not summary_text:
