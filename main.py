@@ -25,7 +25,11 @@ load_dotenv()
 # Configuration
 TELEGRAM_API_ID = os.getenv('TELEGRAM_API_ID')
 TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
-TELEGRAM_CHANNEL = os.getenv('TELEGRAM_CHANNEL', 'Ahboyreads')
+# Support multiple channels
+TELEGRAM_CHANNELS = {
+    'ahboyashreads': 'scrape',  # Scrape article content
+    'shoalresearch': 'translate'  # Translate message directly
+}
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK_URL')
 TELEGRAM_SESSION_B64 = os.getenv('TELEGRAM_SESSION')
@@ -213,6 +217,50 @@ def fetch_article_content(url: str) -> Optional[str]:
         return None
 
 
+def translate_to_korean(text: str, api_key: str) -> str:
+    """
+    Translate English text to Korean using Google Gemini API.
+    
+    Args:
+        text: Text to translate
+        api_key: Google Gemini API key
+        
+    Returns:
+        Korean translation
+    """
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={api_key}"
+        
+        prompt = f"""다음 영문 텍스트를 자연스러운 한국어로 번역해주세요.
+암호화폐/크립토 산업 용어는 원문 그대로 유지하면서 번역해주세요.
+
+영문:
+{text[:3000]}
+
+한국어 번역:"""
+        
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": prompt
+                }]
+            }]
+        }
+        
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        result = response.json()
+        translation = result['candidates'][0]['content']['parts'][0]['text'].strip()
+        
+        return translation
+        
+    except Exception as e:
+        print(f"  ⚠️  Error translating with Gemini: {e}")
+        # Fallback: return original text
+        return text
+
+
 def summarize_with_gemini(text: str, api_key: str, title: str = "") -> str:
     """
     Summarize text using Google Gemini API via REST.
@@ -232,12 +280,12 @@ def summarize_with_gemini(text: str, api_key: str, title: str = "") -> str:
         prompt = f"""다음은 암호화폐/크립토 산업 관련 뉴스입니다. 
 이 내용을 한국어로 정확히 3줄로 요약해주세요. 
 각 줄은 한 문장으로, 핵심 정보만 간결하게 담아주세요.
-번호나 불릿 포인트 없이 각 줄만 작성해주세요.
+각 줄 앞에 1️⃣ 2️⃣ 3️⃣ 이모티콘을 붙여주세요.
 
 뉴스 내용:
 {text[:3000]}
 
-3줄 요약:"""
+3줄 요약 (예시: 1️⃣ 첫번째 요약...\n2️⃣ 두번째 요약...\n3️⃣ 세번째 요약...):"""
         
         payload = {
             "contents": [{
@@ -364,60 +412,76 @@ async def main():
         await client.start()
         print("✅ Connected to Telegram")
         
-        # Fetch yesterday's messages
-        messages = await fetch_yesterday_messages(client, TELEGRAM_CHANNEL)
+        # Process messages from all channels
+        all_summaries = []
         
-        if not messages:
-            print("ℹ️  No messages found from yesterday")
-            # Send empty report to Slack
-            kst = pytz.timezone('Asia/Seoul')
-            yesterday = (datetime.now(kst) - timedelta(days=1)).strftime('%Y년 %m월 %d일')
-            send_to_slack([], SLACK_WEBHOOK_URL, yesterday)
-            return
-        
-        # Summarize each message by fetching link content
-        print(f"🤖 Processing {len(messages)} messages with Google Gemini...")
-        summaries = []
-        for msg in messages:
-            # Extract URLs from message
-            urls = extract_urls(msg['text'])
+        for channel_name, process_type in TELEGRAM_CHANNELS.items():
+            print(f"\n📡 Processing channel: @{channel_name}")
+            messages = await fetch_yesterday_messages(client, channel_name)
             
-            summary_text = None
-            article_url = None
+            if not messages:
+                print(f"  ℹ️  No messages found from {channel_name}")
+                continue
             
-            if urls:
-                # Try to fetch and summarize content from each URL
-                for url in urls:
-                    # Skip X.com and t.me links (require JavaScript/login)
-                    if 'x.com' in url or 't.me' in url or 'twitter.com' in url:
-                        continue
-                    
-                    print(f"  🔗 Fetching content from: {url[:60]}...")
-                    content = fetch_article_content(url)
-                    
-                    if content and len(content) > 100:
-                        # Summarize the article content
-                        summary_text = summarize_with_gemini(content, GEMINI_API_KEY)
-                        article_url = url
-                        break  # Use first successful article
+            print(f"🤖 Processing {len(messages)} messages from @{channel_name}...")
+            
+            for msg in messages:
+                summary_text = None
+                article_url = None
                 
-            # Fallback: if no article found, use message text
-            if not summary_text:
-                summary_text = summarize_with_gemini(msg['text'], GEMINI_API_KEY)
-                article_url = urls[0] if urls else msg['link']
-            
-            summaries.append({
-                'summary': summary_text,
-                'date': msg['date'],
-                'link': article_url or msg['link']
-            })
-            print(f"  ✓ Summarized message {msg['id']}")
+                if process_type == 'scrape':
+                    # For ahboyashreads: scrape article content
+                    urls = extract_urls(msg['text'])
+                    
+                    if urls:
+                        # Try to fetch and summarize content from each URL
+                        for url in urls:
+                            # Skip X.com and t.me links (require JavaScript/login)
+                            if 'x.com' in url or 't.me' in url or 'twitter.com' in url:
+                                continue
+                            
+                            print(f"  🔗 Fetching content from: {url[:60]}...")
+                            content = fetch_article_content(url)
+                            
+                            if content and len(content) > 100:
+                                # Summarize the article content
+                                summary_text = summarize_with_gemini(content, GEMINI_API_KEY)
+                                article_url = url
+                                break  # Use first successful article
+                    
+                    # Skip if no article could be scraped
+                    if not summary_text:
+                        print(f"  ⏭️  Skipped message {msg['id']} (no scrapeable content)")
+                        continue
+                        
+                elif process_type == 'translate':
+                    # For shoalresearch: just translate the message
+                    print(f"  🌐 Translating message {msg['id']}...")
+                    summary_text = translate_to_korean(msg['text'], GEMINI_API_KEY)
+                    urls = extract_urls(msg['text'])
+                    article_url = urls[0] if urls else msg['link']
+                
+                if summary_text:
+                    all_summaries.append({
+                        'summary': summary_text,
+                        'date': msg['date'],
+                        'link': article_url or msg['link'],
+                        'channel': channel_name
+                    })
+                    print(f"  ✓ Processed message {msg['id']}")
+        
+        summaries = all_summaries
         
         # Send to Slack
         kst = pytz.timezone('Asia/Seoul')
         yesterday = (datetime.now(kst) - timedelta(days=1)).strftime('%Y년 %m월 %d일')
-        print(f"📤 Sending summaries to Slack...")
-        send_to_slack(summaries, SLACK_WEBHOOK_URL, yesterday)
+        
+        if summaries:
+            print(f"\n📤 Sending {len(summaries)} summaries to Slack...")
+            send_to_slack(summaries, SLACK_WEBHOOK_URL, yesterday)
+        else:
+            print("ℹ️  No summaries to send to Slack")
+            send_to_slack([], SLACK_WEBHOOK_URL, yesterday)
         
         print("✅ All done!")
         
