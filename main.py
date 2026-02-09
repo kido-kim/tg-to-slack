@@ -206,8 +206,8 @@ def fetch_article_content(url: str) -> Optional[str]:
             lines = [line.strip() for line in content.split('\n') if line.strip()]
             content = '\n'.join(lines)
             
-            # Check minimum length (500 chars)
-            if len(content) < 500:
+            # Check minimum length (300 chars)
+            if len(content) < 300:
                 return None
             
             # Detect paywalls and subscription prompts
@@ -274,8 +274,8 @@ def translate_to_korean(text: str, api_key: str) -> str:
         
     except Exception as e:
         print(f"  ⚠️  Error translating with Gemini: {e}")
-        # Fallback: return original text
-        return text
+        # Return None to indicate translation failure (will skip message)
+        return None
 
 
 def summarize_with_gemini(text: str, api_key: str, title: str = "") -> str:
@@ -460,7 +460,7 @@ async def main():
                             print(f"  🔗 Fetching content from: {url[:60]}...")
                             content = fetch_article_content(url)
                             
-                            if content and len(content) >= 500:
+                            if content and len(content) >= 300:
                                 # Summarize the article content (only if sufficient content)
                                 print(f"      ✓ Fetched {len(content)} chars")
                                 summary_text = summarize_with_gemini(content, GEMINI_API_KEY)
@@ -478,6 +478,12 @@ async def main():
                     # For shoalresearch: just translate the message
                     print(f"  🌐 Translating message {msg['id']}...")
                     summary_text = translate_to_korean(msg['text'], GEMINI_API_KEY)
+                    
+                    # Skip if translation failed
+                    if not summary_text:
+                        print(f"  ⏭️  Skipped message {msg['id']} (translation failed)")
+                        continue
+                    
                     urls = extract_urls(msg['text'])
                     article_url = urls[0] if urls else msg['link']
                 
@@ -515,4 +521,17 @@ async def main():
 
 if __name__ == '__main__':
     import asyncio
+    import sys
+    
+    # Support channel filtering from command line
+    if len(sys.argv) > 1:
+        channel_filter = sys.argv[1]
+        if channel_filter in TELEGRAM_CHANNELS:
+            # Filter to only process specified channel
+            TELEGRAM_CHANNELS = {channel_filter: TELEGRAM_CHANNELS[channel_filter]}
+        else:
+            print(f"Unknown channel: {channel_filter}")
+            print(f"Available channels: {', '.join(TELEGRAM_CHANNELS.keys())}")
+            sys.exit(1)
+    
     asyncio.run(main())
