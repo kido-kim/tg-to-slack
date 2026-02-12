@@ -9,6 +9,7 @@ import os
 import sys
 import base64
 import re
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import pytz
@@ -270,6 +271,9 @@ def translate_to_korean(text: str, api_key: str) -> str:
         result = response.json()
         translation = result['candidates'][0]['content']['parts'][0]['text'].strip()
         
+        # Add delay to avoid rate limiting
+        time.sleep(4.5)
+        
         return translation
         
     except Exception as e:
@@ -318,6 +322,9 @@ def summarize_with_gemini(text: str, api_key: str, title: str = "") -> str:
         result = response.json()
         summary = result['candidates'][0]['content']['parts'][0]['text'].strip()
         
+        # Add delay to avoid rate limiting (Gemini free tier: 15 RPM)
+        time.sleep(4.5)  # 60s / 15 requests = 4s per request, add buffer
+        
         # Ensure we have exactly 3 lines
         lines = [line.strip() for line in summary.split('\n') if line.strip()]
         if len(lines) > 3:
@@ -337,6 +344,7 @@ def summarize_with_gemini(text: str, api_key: str, title: str = "") -> str:
 def send_to_slack(summaries: List[Dict], webhook_url: str, date: str):
     """
     Send summaries to Slack via webhook.
+    Split into multiple messages if needed to avoid Slack's 50 block limit.
     
     Args:
         summaries: List of message summaries
@@ -347,68 +355,86 @@ def send_to_slack(summaries: List[Dict], webhook_url: str, date: str):
         print("ℹ️  No summaries to send to Slack")
         return
     
-    # Build Slack message
-    blocks = [
-        {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": f"📰 Ahboyreads 일간 크립토 뉴스 요약 - {date}",
-                "emoji": True
-            }
-        },
-        {
-            "type": "divider"
-        }
-    ]
+    # Determine channel name from summaries
+    channel_name = summaries[0].get('channel', 'Unknown')
+    channel_display = {
+        'ahboyashreads': 'Ahboyreads',
+        'shoalresearch': 'Shoal Research'
+    }.get(channel_name, channel_name)
     
-    for idx, summary in enumerate(summaries, 1):
-        # Add message section
-        time_str = summary['date'].strftime('%H:%M')
-        
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*{idx}. [{time_str}] 뉴스*\n{summary['summary']}"
+    # Split summaries into chunks (max 15 per message to stay under 50 blocks)
+    # Each summary = 3 blocks (section + link + divider)
+    chunk_size = 15
+    chunks = [summaries[i:i + chunk_size] for i in range(0, len(summaries), chunk_size)]
+    
+    for chunk_idx, chunk in enumerate(chunks, 1):
+        # Build Slack message for this chunk
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"📰 {channel_display} 일간 크립토 뉴스 요약 - {date}" + (f" ({chunk_idx}/{len(chunks)})" if len(chunks) > 1 else ""),
+                    "emoji": True
+                }
+            },
+            {
+                "type": "divider"
             }
-        })
+        ]
         
-        # Add link button if available
-        if summary.get('link'):
+        start_idx = (chunk_idx - 1) * chunk_size
+        for idx, summary in enumerate(chunk, start_idx + 1):
+            # Add message section
+            time_str = summary['date'].strftime('%H:%M')
+            
             blocks.append({
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"<{summary['link']}|📎 원문 보기>"
+                    "text": f"*{idx}. [{time_str}] 뉴스*\n{summary['summary']}"
                 }
             })
+            
+            # Add link button if available
+            if summary.get('link'):
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"<{summary['link']}|📎 원문 보기>"
+                    }
+                })
+            
+            # Add divider between messages (except after the last one)
+            if idx < start_idx + len(chunk):
+                blocks.append({"type": "divider"})
         
-        # Add divider between messages (except after the last one)
-        if idx < len(summaries):
-            blocks.append({"type": "divider"})
-    
-    # Add footer
-    blocks.append({
-        "type": "context",
-        "elements": [
-            {
-                "type": "mrkdwn",
-                "text": f"총 {len(summaries)}개의 뉴스 | Powered by Google Gemini"
-            }
-        ]
-    })
-    
-    payload = {
-        "blocks": blocks
-    }
-    
-    try:
-        response = requests.post(webhook_url, json=payload)
-        response.raise_for_status()
-        print(f"✅ Successfully sent {len(summaries)} summaries to Slack")
-    except Exception as e:
-        print(f"❌ Error sending to Slack: {e}")
+        # Add footer
+        if chunk_idx == len(chunks):
+            blocks.append({
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"총 {len(summaries)}개의 뉴스 | Powered by Google Gemini"
+                    }
+                ]
+            })
+        
+        payload = {
+            "blocks": blocks
+        }
+        
+        try:
+            response = requests.post(webhook_url, json=payload)
+            response.raise_for_status()
+            if len(chunks) > 1:
+                print(f"✅ Successfully sent chunk {chunk_idx}/{len(chunks)} ({len(chunk)} summaries)")
+            else:
+                print(f"✅ Successfully sent {len(summaries)} summaries to Slack")
+        except Exception as e:
+            print(f"❌ Error sending chunk {chunk_idx} to Slack: {e}")
 
 
 async def main():
